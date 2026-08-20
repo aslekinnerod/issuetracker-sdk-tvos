@@ -1,0 +1,45 @@
+# XcodeGen spec for the sample app. Run `xcodegen generate` from
+# this directory to produce IssuetrackerTVExample.xcodeproj (it's
+# gitignored — the spec is the source of truth).
+#
+# The app depends on the parent IssuetrackerTVSDK as a local Swift
+# Package via the `packages` block below, so a Cmd-R cycle on
+# IssuetrackerTVExample.xcodeproj picks up your latest SDK edits
+# without any explicit publish step.
+
+name: IssuetrackerTVExample
+
+options:
+  bundleIdPrefix: no.issuetracker
+  developmentLanguage: en
+  deploymentTarget:
+    tvOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  IssuetrackerTVSDK:
+    path: ../
+
+targets:
+  IssuetrackerTVExample:
+    type: application
+    platform: tvOS
+    sources:
+      - IssuetrackerTVExample
+    dependencies:
+      - package: IssuetrackerTVSDK
+        product: IssuetrackerTVSDK
+    info:
+      path: IssuetrackerTVExample/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: no.issuetracker.example.tv
+        TARGETED_DEVICE_FAMILY: "3"
+        SWIFT_VERSION: "5.9"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic

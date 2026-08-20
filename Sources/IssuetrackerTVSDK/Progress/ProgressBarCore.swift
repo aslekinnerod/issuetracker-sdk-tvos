@@ -1,0 +1,197 @@
+import SwiftUI
+
+// TV density: fixed point sizes here are the handheld reference × 2,
+// matching ProgressTokens. Motion math is identical to sdk-ios.
+struct IndeterminateSweep: View {
+    let color: Color
+
+    // Reduce Motion (2.3.3): replace the continuous sweep with a
+    // static tinted track.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if reduceMotion {
+            Rectangle()
+                .fill(color.opacity(0.35))
+                .background(color.opacity(0.13))
+                .clipShape(Capsule())
+        } else {
+            animatedSweep
+        }
+    }
+
+    private var animatedSweep: some View {
+        GeometryReader { proxy in
+            TimelineView(.animation) { context in
+                let cycle = ProgressTokens.Motion.sweepDurationMs / 1000.0
+                let t = context.date.timeIntervalSinceReferenceDate
+                let phase = (t.truncatingRemainder(dividingBy: cycle)) / cycle
+                let ease = phase < 0.5
+                    ? 2 * phase * phase
+                    : 1 - pow(-2 * phase + 2, 2) / 2
+                let trackWidth = proxy.size.width
+                let highlightWidth = trackWidth * ProgressTokens.Motion.sweepHighlightWidthFraction
+                let leftPx = -highlightWidth + (trackWidth + highlightWidth) * ease
+
+                Rectangle()
+                    .fill(LinearGradient(
+                        gradient: Gradient(colors: [.clear, color, .clear]),
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    ))
+                    .frame(width: highlightWidth)
+                    .offset(x: leftPx)
+            }
+        }
+        .background(color.opacity(0.13))
+        .clipShape(Capsule())
+    }
+}
+
+struct ProgressFill: View {
+    let presentation: ProgressPresentation
+    let variant: ProgressVariant
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule().fill(ProgressTokens.NeutralColor.track)
+
+                if presentation.deterministicFillVisible {
+                    Capsule()
+                        .fill(LinearGradient(
+                            gradient: Gradient(colors: gradientColors),
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        ))
+                        .overlay(alignment: .trailing) {
+                            // WCAG 1.4.11 head cap: the fill's leading edge
+                            // renders in the variant's graphic colour so the
+                            // progress boundary against the track meets 3:1.
+                            // Clipped to the capsule's rounded corner below.
+                            if let capColor = headCapColor {
+                                Rectangle()
+                                    .fill(capColor)
+                                    .frame(width: ProgressTokens.Track.headCapMinWidth)
+                            }
+                        }
+                        .clipShape(Capsule())
+                        .frame(width: max(0, proxy.size.width * presentation.fillWidthPercent / 100.0))
+                        .animation(
+                            .linear(duration: ProgressTokens.Motion.fillDurationMs / 1000.0),
+                            value: presentation.fillWidthPercent
+                        )
+                } else {
+                    IndeterminateSweep(color: variant.graphicOrAccent)
+                }
+            }
+        }
+    }
+
+    private var gradientColors: [Color] {
+        if presentation.tintIsError {
+            return [ProgressTokens.ErrorColor.dark, ProgressTokens.ErrorColor.accent]
+        }
+        return variant.fillGradient
+    }
+
+    // Only variants that define a graphic colour draw a head cap; the
+    // error fill already meets 3:1 against the track, so no cap there.
+    private var headCapColor: Color? {
+        if presentation.tintIsError { return nil }
+        return variant.graphic
+    }
+}
+
+struct PhaseDot: View {
+    let phase: IssueProgressPhase
+    let accent: Color
+
+    var body: some View {
+        switch phase {
+        case .done:
+            CheckDot(color: accent)
+        case .error:
+            Circle()
+                .fill(ProgressTokens.ErrorColor.accent)
+                .frame(width: 20, height: 20)
+        case .stalled:
+            Circle()
+                .fill(ProgressTokens.NeutralColor.subtle)
+                .frame(width: 16, height: 16)
+        case .idle, .uploading, .processing:
+            PulsingDot(color: accent)
+        }
+    }
+}
+
+private struct PulsingDot: View {
+    let color: Color
+
+    // Reduce Motion (2.3.3): render a static dot.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if reduceMotion {
+            Circle()
+                .fill(color)
+                .frame(width: 16, height: 16)
+                .frame(width: 24, height: 24)
+        } else {
+            pulsing
+        }
+    }
+
+    private var pulsing: some View {
+        TimelineView(.animation) { context in
+            let cycle = ProgressTokens.Motion.phaseDotPulseDurationMs / 1000.0
+            let t = context.date.timeIntervalSinceReferenceDate
+            let phase = (t.truncatingRemainder(dividingBy: cycle)) / cycle
+            let p = (1 - cos(phase * 2 * .pi)) / 2
+            let scale = 1.0 + 0.4 * p
+            let opacity = 1.0 - 0.45 * p
+
+            Circle()
+                .fill(color)
+                .frame(width: 16, height: 16)
+                .scaleEffect(scale)
+                .opacity(opacity)
+        }
+        .frame(width: 24, height: 24)
+    }
+}
+
+private struct CheckDot: View {
+    let color: Color
+    @State private var popped = false
+
+    var body: some View {
+        ZStack {
+            Circle().fill(color)
+            CheckMarkShape()
+                .stroke(Color.white, style: StrokeStyle(lineWidth: 3.2, lineCap: .round, lineJoin: .round))
+                .frame(width: 18, height: 18)
+        }
+        .frame(width: 28, height: 28)
+        .scaleEffect(popped ? 1.0 : 0.4)
+        .opacity(popped ? 1.0 : 0.0)
+        .onAppear {
+            withAnimation(
+                .timingCurve(0.34, 1.56, 0.64, 1, duration: ProgressTokens.Motion.doneCheckmarkDurationMs / 1000.0)
+            ) {
+                popped = true
+            }
+        }
+    }
+}
+
+private struct CheckMarkShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let s = min(rect.width, rect.height) / 9.0
+        path.move(to: CGPoint(x: 1.5 * s, y: 4.8 * s))
+        path.addLine(to: CGPoint(x: 3.6 * s, y: 6.8 * s))
+        path.addLine(to: CGPoint(x: 7.5 * s, y: 2.2 * s))
+        return path
+    }
+}
