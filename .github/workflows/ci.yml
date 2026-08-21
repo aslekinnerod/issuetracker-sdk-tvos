@@ -16,3 +16,9 @@ jobs:
             -scheme IssuetrackerTVSDK \
             -destination 'generic/platform=tvOS' \
             build
+      - name: Test on tvOS Simulator
+        run: |
+          xcodebuild \
+            -scheme IssuetrackerTVSDK \
+            -destination 'platform=tvOS Simulator,name=Apple TV' \
+            test
