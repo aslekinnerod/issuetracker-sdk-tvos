@@ -43,3 +43,38 @@ targets:
         SWIFT_VERSION: "5.9"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         CODE_SIGN_STYLE: Automatic
+
+  # On-device E2E for the TV trigger contract (sdk-spec/TV_TRIGGERS.md).
+  # XCUIRemote is the only way to produce a genuine timed Play/Pause
+  # hold on the simulator. Run:
+  #   xcodebuild test -project IssuetrackerTVExample.xcodeproj \
+  #     -scheme IssuetrackerTVExample \
+  #     -destination 'platform=tvOS Simulator,name=Apple TV'
+  # Pass a real key for the submission round-trip via
+  #   TEST_RUNNER_ISSUETRACKER_API_KEY=it_dev_... (env → test runner).
+  IssuetrackerTVExampleUITests:
+    type: bundle.ui-testing
+    platform: tvOS
+    sources:
+      - IssuetrackerTVExampleUITests
+    dependencies:
+      - target: IssuetrackerTVExample
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: no.issuetracker.example.tv.uitests
+        SWIFT_VERSION: "5.9"
+        TEST_TARGET_NAME: IssuetrackerTVExample
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  IssuetrackerTVExample:
+    build:
+      targets:
+        IssuetrackerTVExample: all
+        IssuetrackerTVExampleUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - IssuetrackerTVExampleUITests
