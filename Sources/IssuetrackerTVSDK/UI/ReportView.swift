@@ -178,6 +178,11 @@ struct ReportView: View {
             BrandCheckRow(title: "Include screenshot", isOn: $includeScreenshot)
         }
         .frame(width: 560)
+        // Focus reachability: the check row sits top-right with no
+        // vertical overlap against the mid-panel form fields, so a
+        // plain right-press from them finds nothing. A focus section
+        // makes the whole column a target for lateral moves.
+        .focusSection()
     }
 
     private var footer: some View {
@@ -200,6 +205,12 @@ struct ReportView: View {
         }
         .padding(Tokens.Space.s4)
         .background(Tokens.surfaceApp)
+        // Focus reachability: Cancel/Send are right-aligned, so they
+        // share no horizontal overlap with the left-column fields —
+        // without a focus section, a down-press from the description
+        // field is a dead end and the form cannot be submitted with
+        // the remote. (Caught by the E2E suite.)
+        .focusSection()
     }
 
     // MARK: - Actions
