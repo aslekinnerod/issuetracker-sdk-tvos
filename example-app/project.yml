@@ -49,9 +49,14 @@ targets:
   # hold on the simulator. Run:
   #   xcodebuild test -project IssuetrackerTVExample.xcodeproj \
   #     -scheme IssuetrackerTVExample \
-  #     -destination 'platform=tvOS Simulator,name=Apple TV'
+  #     -destination "id=$(../scripts/tv-simulator-udid.sh)"
+  # Resolve the destination with that script rather than hardcoding a
+  # device name: `name=Apple TV` matches nothing on modern Xcode, which
+  # is exactly how CI's only test step silently stopped being runnable.
   # Pass a real key for the submission round-trip via
   #   TEST_RUNNER_ISSUETRACKER_API_KEY=it_dev_... (env → test runner).
+  # Add TEST_RUNNER_REQUIRE_E2E_KEY=1 to make a missing key fail instead
+  # of skipping the round-trip.
   IssuetrackerTVExampleUITests:
     type: bundle.ui-testing
     platform: tvOS

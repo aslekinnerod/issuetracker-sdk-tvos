@@ -3,22 +3,199 @@ name: CI
 on:
   push:
     branches: [main]
+    # For a SwiftPM library the git tag IS the artifact: README tells
+    # consumers `.package(url: ..., from: "0.1.0")` and they resolve the tag
+    # directly. Without this trigger nothing ever built the tagged commit,
+    # and an absent check looks exactly like a passing one.
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs (a stale run can otherwise report status after
+  # a newer commit's). Never cancel main/tag runs: they gate what ships.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned toolchain — see scripts/select-xcode.sh. `macos-latest` and the
+  # image's default Xcode both move without a commit here, which changes the
+  # Swift compiler and the tvOS SDK under us. Bump this line deliberately;
+  # the select step fails with the list of installed versions if it is stale.
+  XCODE_VERSION: "16.4"
+
 jobs:
-  build:
-    runs-on: macos-latest
+  package:
+    name: Package (Release build + unit tests)
+    # Concrete image label, not `macos-latest`: an image roll should be a
+    # commit, not a surprise.
+    runs-on: macos-15
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - name: Build for tvOS
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Select pinned Xcode
+        run: ./scripts/select-xcode.sh
+      # Two lines, not one. `echo "X=$(script)" >> file` runs the script
+      # in an argument position, where a non-zero exit is NOT caught by
+      # `set -e`: the step would succeed, write an empty TV_SIM_UDID,
+      # and the failure would resurface steps later as an opaque
+      # `-destination "id="` error with the resolver's own diagnostic
+      # (the installed-runtime list) scrolled far off screen. A bare
+      # assignment does propagate the failure.
+      - name: Resolve tvOS simulator
+        run: |
+          set -euo pipefail
+          udid=$(./scripts/tv-simulator-udid.sh)
+          echo "TV_SIM_UDID=$udid" >> "$GITHUB_ENV"
+      # Release is the configuration consumers actually ship (this SDK is
+      # compiled from source in their archive), so optimiser-only failures
+      # have to surface here rather than in a customer's build.
+      - name: Build for tvOS device (Release)
         run: |
           xcodebuild \
             -scheme IssuetrackerTVSDK \
             -destination 'generic/platform=tvOS' \
+            -configuration Release \
             build
-      - name: Test on tvOS Simulator
+      - name: Unit tests on tvOS Simulator (Debug)
         run: |
+          rm -rf UnitTests.xcresult
           xcodebuild \
             -scheme IssuetrackerTVSDK \
-            -destination 'platform=tvOS Simulator,name=Apple TV' \
+            -destination "id=$TV_SIM_UDID" \
+            -configuration Debug \
+            -resultBundlePath UnitTests.xcresult \
             test
+      # The floor is near the real count (50 across 5 suites as of this
+      # commit), not 1. At 1, a build that silently stopped compiling
+      # four of the five test files still cleared the assertion.
+      - name: Assert the unit tests actually ran
+        run: ./scripts/assert-test-results.sh UnitTests.xcresult 45
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: unit-test-results
+          path: UnitTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+  example-app:
+    name: Example app (trigger contract E2E)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Select pinned Xcode
+        run: ./scripts/select-xcode.sh
+      - name: Install XcodeGen
+        run: command -v xcodegen >/dev/null || brew install xcodegen
+      # The .xcodeproj is gitignored and project.yml calls itself the source
+      # of truth, so generating it here is also the only check that the spec
+      # still produces a buildable project.
+      - name: Generate the example Xcode project
+        working-directory: example-app
+        run: xcodegen generate
+      # Two lines — see the identical step in the `package` job.
+      - name: Resolve tvOS simulator
+        run: |
+          set -euo pipefail
+          udid=$(./scripts/tv-simulator-udid.sh)
+          echo "TV_SIM_UDID=$udid" >> "$GITHUB_ENV"
+      # Compiling the sample app is itself coverage: it is the only thing
+      # that catches an SDK API change breaking the documented integration.
+      - name: Build example app and UI tests
+        run: |
+          rm -rf E2E.xcresult
+          xcodebuild build-for-testing \
+            -project example-app/IssuetrackerTVExample.xcodeproj \
+            -scheme IssuetrackerTVExample \
+            -destination "id=$TV_SIM_UDID" \
+            -derivedDataPath DerivedData
+      # The 2-second Play/Pause hold is the whole trigger contract of this
+      # SDK (sdk-spec/TV_TRIGGERS.md) and XCUIRemote.press(_:forDuration:)
+      # is the only way to produce a genuine timed hold — no unit test can
+      # substitute, which is why this job exists.
+      #
+      # All three tests need a real key: the example app's baked-in
+      # it_dev_ placeholder gets a terminal response from the backend, the
+      # SDK goes TERMINATED, and the reporter never opens. The key is
+      # asserted non-empty BEFORE xcodebuild, passed with the TEST_RUNNER_
+      # prefix (Xcode strips it when injecting into the UI-test runner),
+      # and REQUIRE_E2E_KEY turns a key that never arrives into an XCTFail
+      # instead of an XCTSkip. assert-test-results then rejects any skip,
+      # so a silently-skipped round-trip cannot pass as a green run.
+      #
+      # Same-repo PRs get secrets and run this; a fork PR cannot, and gets
+      # only the build-for-testing step above. Never move the key to
+      # pull_request_target to work around that.
+      #
+      # OFF until the secret exists. secrets.ISSUETRACKER_TV_E2E_API_KEY
+      # has not been provisioned, so as written this step fails on every
+      # push to main, every tag and every same-repo PR — and the tag
+      # trigger added in the same change means the next release fails
+      # too. The fail-loudly design below is right; shipping it before
+      # the key exists is not, because a permanently red main destroys
+      # the signal the job is for.
+      #
+      # NOT COVERED while this is off: the 2-second Play/Pause hold
+      # contract and the submission round-trip are asserted by nothing.
+      # What still runs above — xcodegen generate and
+      # build-for-testing — proves the spec still produces a buildable
+      # project and that the example app and its UI tests compile
+      # against the current SDK API. That is real, but it is compile
+      # coverage, not trigger coverage.
+      #
+      # TO ENABLE (no commit needed): add repository secret
+      # ISSUETRACKER_TV_E2E_API_KEY, provisioned for bundle id
+      # no.issuetracker.example.tv, then set repository variable
+      # TV_E2E=true. Watch the first run: the two hold tests have never
+      # been green on a runner, only reasoned about, so budget a round
+      # of iteration before anything depends on them.
+      - name: Trigger contract + submission round-trip (E2E)
+        if: vars.TV_E2E == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          TEST_RUNNER_ISSUETRACKER_API_KEY: ${{ secrets.ISSUETRACKER_TV_E2E_API_KEY }}
+          TEST_RUNNER_REQUIRE_E2E_KEY: "1"
+        run: |
+          if [ -z "$TEST_RUNNER_ISSUETRACKER_API_KEY" ]; then
+            echo "::error::secrets.ISSUETRACKER_TV_E2E_API_KEY is empty — the trigger contract cannot be verified without it. Add a key provisioned for no.issuetracker.example.tv." >&2
+            exit 1
+          fi
+          xcodebuild test-without-building \
+            -project example-app/IssuetrackerTVExample.xcodeproj \
+            -scheme IssuetrackerTVExample \
+            -destination "id=$TV_SIM_UDID" \
+            -derivedDataPath DerivedData \
+            -resultBundlePath E2E.xcresult
+          ./scripts/assert-test-results.sh E2E.xcresult 3
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: e2e-test-results
+          path: E2E.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release-guard:
+    name: Release guard
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      # A tag pushed from a local branch, an amended commit, or a dirty tree
+      # reaches every SPM consumer. The package/example jobs prove the tagged
+      # commit builds and passes; this proves it is the code that was
+      # reviewed on main.
+      - name: Assert the tag is reachable from main
+        run: |
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not an ancestor of origin/main — it was cut from code that is not on main." >&2
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} is reachable from origin/main."

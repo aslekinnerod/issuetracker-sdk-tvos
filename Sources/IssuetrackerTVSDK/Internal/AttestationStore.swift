@@ -19,6 +19,12 @@ final class AttestationStore {
     static let shared = AttestationStore()
 
     private let defaults: UserDefaults
+    // Injected for the same reason `defaults` is: `LifecycleStore` is a
+    // one-way state machine on a process-wide singleton, so a test that
+    // exercised the real termination path against `.shared` would
+    // poison every test that ran after it. Production always gets
+    // `.shared` via the default argument.
+    private let lifecycle: LifecycleStore
     private let configApiKeyKey = "io.issuetracker.sdk.remoteConfig.apiKey"
     private let configRequireKey = "io.issuetracker.sdk.remoteConfig.requireTesterAttestation"
     private let tokenKey = "io.issuetracker.sdk.testerToken"
@@ -29,8 +35,12 @@ final class AttestationStore {
     // the per-prefix fail-mode default.
     private var known: Bool?
 
-    init(defaults: UserDefaults = .standard) {
+    // `lifecycle` defaults to nil rather than to `.shared` directly:
+    // default-argument expressions are evaluated in a nonisolated
+    // context, and `LifecycleStore.shared` is @MainActor.
+    init(defaults: UserDefaults = .standard, lifecycle: LifecycleStore? = nil) {
         self.defaults = defaults
+        self.lifecycle = lifecycle ?? .shared
     }
 
     /// Synchronous part of configure(): seed the in-memory value from
@@ -65,7 +75,7 @@ final class AttestationStore {
             // Anything else (offline, transient) leaves the cached /
             // fail-mode value in charge.
             if let reason = err.sdkErrorReason, reason.isTerminal {
-                LifecycleStore.shared.transitionToTerminated(
+                lifecycle.transitionToTerminated(
                     reason: reason,
                     callback: runtime.onConfigurationError
                 )

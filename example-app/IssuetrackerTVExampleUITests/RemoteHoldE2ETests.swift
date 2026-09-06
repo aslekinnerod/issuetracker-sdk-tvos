@@ -5,14 +5,30 @@ import XCTest
 /// the reporter. `XCUIRemote.press(_:forDuration:)` is the only way to
 /// produce a genuine timed hold on the simulator.
 ///
-/// The submission round-trip needs a real key:
+/// The submission round-trip needs a real key. xcodebuild strips the
+/// `TEST_RUNNER_` prefix when injecting environment into the UI-test
+/// runner process, so pass it prefixed and read it unprefixed here:
 ///   TEST_RUNNER_ISSUETRACKER_API_KEY=it_dev_... xcodebuild test ...
-/// Without one the round-trip test skips; the trigger tests run on the
-/// baked-in it_dev_ placeholder (fails open on attestation).
+/// Without one the round-trip test skips locally. The trigger tests need
+/// a real key too: on the baked-in it_dev_ placeholder the backend
+/// answers with a terminal error, the SDK goes TERMINATED and the
+/// reporter never opens, so both hold tests fail.
+///
+/// A skip must never stand in for coverage in CI — xcodebuild reports a
+/// skipped test as a non-failure, so a missing, expired or rotated key
+/// would silently delete the only end-to-end verification and the run
+/// would still go green. Set TEST_RUNNER_REQUIRE_E2E_KEY=1 (CI does) to
+/// turn a key that never arrives into a failure instead.
 final class RemoteHoldE2ETests: XCTestCase {
 
     private var apiKey: String? {
         ProcessInfo.processInfo.environment["ISSUETRACKER_API_KEY"]
+    }
+
+    /// Set as TEST_RUNNER_REQUIRE_E2E_KEY=1 wherever a missing key must be
+    /// a failure rather than a skip.
+    private var requiresAPIKey: Bool {
+        ProcessInfo.processInfo.environment["REQUIRE_E2E_KEY"] == "1"
     }
 
     private func launchApp(identified: Bool) -> XCUIApplication {
@@ -104,6 +120,19 @@ final class RemoteHoldE2ETests: XCTestCase {
             reporterVisible(app),
             "reporter opened on a short tap — violates TV_TRIGGERS.md"
         )
+        // The assertion above passes for free whenever the trigger is dead
+        // — a TERMINATED install, an unregistered observer, a broken key —
+        // so on its own it is not evidence that short taps are being
+        // ignored. Prove the trigger was live in this very session before
+        // trusting the negative.
+        XCUIRemote.shared.press(.playPause, forDuration: 2.3)
+        failIfTerminated(app)
+        XCTAssertTrue(
+            app.staticTexts["Tell us what broke"].waitForExistence(timeout: 5) ||
+                app.staticTexts["One thing first"].exists,
+            "control failed: the hold trigger was not live, so 'short tap " +
+            "did nothing' proves nothing"
+        )
     }
 
     func testTwoSecondHoldOpensReporter() {
@@ -124,6 +153,15 @@ final class RemoteHoldE2ETests: XCTestCase {
     /// response; failures keep it up with an inline error.
     func testFullSubmissionRoundTripSucceeds() throws {
         guard let apiKey, !apiKey.isEmpty else {
+            if requiresAPIKey {
+                XCTFail(
+                    "REQUIRE_E2E_KEY is set but no ISSUETRACKER_API_KEY " +
+                    "reached the test runner — pass it to xcodebuild as " +
+                    "TEST_RUNNER_ISSUETRACKER_API_KEY (the prefix is " +
+                    "stripped on injection)"
+                )
+                return
+            }
             throw XCTSkip("no ISSUETRACKER_API_KEY in test-runner env")
         }
         let app = launchApp(identified: true)
