@@ -68,11 +68,11 @@ jobs:
             -configuration Debug \
             -resultBundlePath UnitTests.xcresult \
             test
-      # The floor is near the real count (50 across 5 suites as of this
+      # The floor is near the real count (61 across 5 suites as of this
       # commit), not 1. At 1, a build that silently stopped compiling
       # four of the five test files still cleared the assertion.
       - name: Assert the unit tests actually ran
-        run: ./scripts/assert-test-results.sh UnitTests.xcresult 45
+        run: ./scripts/assert-test-results.sh UnitTests.xcresult 56
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
         with:

@@ -82,6 +82,51 @@ final class LifecycleStoreTests: XCTestCase {
         XCTAssertFalse(store.isTerminated)
     }
 
+    // MARK: - Purge hooks (ADR-0003 Decision 9 §6)
+
+    func testPurgeHandlersRunOnTheTerminalTransitionBeforeTheHostCallback() {
+        let store = LifecycleStore(defaults: defaults)
+        var order: [String] = []
+        store.onTerminate(id: "token") { order.append("purge") }
+
+        store.transitionToTerminated(reason: .projectDeleted, callback: { _ in
+            order.append("callback")
+        })
+
+        // Order matters: a host forwarding the callback to its own
+        // telemetry must observe state that is already purged.
+        XCTAssertEqual(order, ["purge", "callback"])
+    }
+
+    func testPurgeHandlersDoNotRunWhileTheSdkIsHealthy() {
+        let store = LifecycleStore(defaults: defaults)
+        var purges = 0
+        store.onTerminate(id: "token") { purges += 1 }
+        XCTAssertEqual(purges, 0)
+    }
+
+    func testPurgeHandlerRunsImmediatelyWhenTheStoreIsAlreadyTerminated() {
+        // The launch after a purge that never finished — process killed
+        // between the marker write and the handler.
+        defaults.set("api_key_revoked", forKey: "io.issuetracker.sdk.terminatedReason")
+        let store = LifecycleStore(defaults: defaults)
+        var purges = 0
+        store.onTerminate(id: "token") { purges += 1 }
+        XCTAssertEqual(purges, 1)
+    }
+
+    func testReRegisteringTheSameIdReplacesRatherThanStacks() {
+        // configure() may be called more than once; its breadcrumb
+        // handler must not accumulate.
+        let store = LifecycleStore(defaults: defaults)
+        var purges = 0
+        store.onTerminate(id: "breadcrumbs") { purges += 1 }
+        store.onTerminate(id: "breadcrumbs") { purges += 1 }
+
+        store.transitionToTerminated(reason: .projectDeleted, callback: nil)
+        XCTAssertEqual(purges, 1)
+    }
+
     func testPreservesFirstReasonOnSecondSignal() {
         // Server says workspace_suspended first; a later report
         // somehow gets project_deleted. The lifecycle keeps the

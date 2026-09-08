@@ -401,7 +401,10 @@ final class TerminationContractTests: XCTestCase {
         // in-session only (`ReportingSession.submit` fires one request
         // and surfaces failure to the user), so §6's "drop the queue
         // atomically" is satisfied by construction rather than by code.
-        // This test pins that structural fact — if a queue is ever
+        // What §6 does cost code here is the report-bearing state that
+        // *does* persist — the tester token and the breadcrumb file —
+        // purged via `LifecycleStore.onTerminate`; see the tests below.
+        // This test pins the structural fact — if a queue is ever
         // added, it must be purged on the terminal transition and this
         // test must be replaced, not deleted.
         let sdkFiles = FileManager.default
@@ -415,42 +418,77 @@ final class TerminationContractTests: XCTestCase {
         )
     }
 
-    func testTerminationDoesNotPurgeThePersistedTesterToken_KNOWN_GAP() async {
-        // GAP (audit finding): the `itt_` tester token is a live ingest
-        // credential for the very project the server has just declared
-        // deleted / revoked / suspended, and it outlives termination in
-        // UserDefaults. ADR-0003 Decision 9 §6's intent is that no
-        // report-bearing state survives the terminal signal.
-        //
-        // This asserts CURRENT behaviour so the gap is executable. When
-        // `transitionToTerminated` learns to purge, invert it.
+    func testTerminationPurgesThePersistedTesterToken() async {
+        // ADR-0003 Decision 9 §6. The `itt_` tester token is a live
+        // ingest credential for the very project the server has just
+        // declared deleted / revoked / suspended: it is report-bearing
+        // state and goes with the queue on the terminal signal.
         let lifecycle = LifecycleStore(defaults: defaults)
         let store = AttestationStore(defaults: defaults, lifecycle: lifecycle)
         store.setTesterToken("itt_livecredential", expiresAt: nil)
+        XCTAssertEqual(store.testerToken, "itt_livecredential", "precondition")
 
         stub(status: 403, body: callableErrorBody(reason: "workspace_suspended", recoverable: false))
         await store.refreshRemoteConfig(runtime: runtime())
 
         XCTAssertTrue(lifecycle.isTerminated)
-        XCTAssertEqual(
-            store.testerToken, "itt_livecredential",
-            "documents the un-purged credential; flip this assertion when the gap is closed"
+        XCTAssertNil(store.testerToken, "the ingest credential must not outlive termination")
+        XCTAssertNil(
+            defaults.string(forKey: "io.issuetracker.sdk.testerToken"),
+            "purged from memory but left on disk is not purged"
         )
     }
 
-    func testTerminatedSdkStillCallsTheConfigEndpointOnRelaunch_KNOWN_GAP() async {
-        // GAP (audit finding): ADR-0005 states the invariant outright —
-        // "a TERMINATED SDK never attempts attestation" — and ADR-0003
-        // Decision 9 §2 requires TERMINATED to disable all background
-        // tasks. `Issuetracker.configure()` calls
-        // `refreshRemoteConfig` unconditionally, and
-        // `refreshRemoteConfig` has no `isTerminated` guard, so every
-        // terminated install hits `getSdkConfig` once per app launch,
-        // forever. That is precisely the deployed-cohort hammering
-        // Decision 9 exists to cap.
-        //
-        // Asserts CURRENT behaviour. When the guard lands, this becomes
-        // `XCTAssertEqual(StubURLProtocol.requestCount, before)`.
+    func testANonTerminalFailureLeavesTheTesterTokenAlone() async {
+        // The mirror image, and the one that matters for not breaking a
+        // healthy install: a quota rejection (or an ADR-0005 gating
+        // one) must not cost the tester their credential.
+        let lifecycle = LifecycleStore(defaults: defaults)
+        let store = AttestationStore(defaults: defaults, lifecycle: lifecycle)
+        store.setTesterToken("itt_livecredential", expiresAt: nil)
+
+        stub(status: 429, body: callableErrorBody(reason: "quota_exceeded", recoverable: true))
+        await store.refreshRemoteConfig(runtime: runtime())
+
+        XCTAssertFalse(lifecycle.isTerminated)
+        XCTAssertEqual(store.testerToken, "itt_livecredential")
+    }
+
+    func testAPurgeThatNeverFinishedIsRedoneOnTheNextLaunch() {
+        // Process killed between the marker write and the purge. A
+        // fresh store over the same defaults finds the marker and must
+        // clear the leftover credential rather than carry it forward.
+        defaults.set("project_deleted", forKey: "io.issuetracker.sdk.terminatedReason")
+        defaults.set("itt_leftover", forKey: "io.issuetracker.sdk.testerToken")
+
+        let afterRelaunch = LifecycleStore(defaults: defaults)
+        let store = AttestationStore(defaults: defaults, lifecycle: afterRelaunch)
+
+        XCTAssertTrue(afterRelaunch.isTerminated)
+        XCTAssertNil(store.testerToken)
+    }
+
+    func testATerminatedSdkRefusesToStoreANewTesterToken() {
+        // The companion handshake has no way of knowing this install is
+        // dead. Accepting the token would re-create the state the purge
+        // just removed.
+        let lifecycle = LifecycleStore(defaults: defaults)
+        let store = AttestationStore(defaults: defaults, lifecycle: lifecycle)
+        lifecycle.transitionToTerminated(reason: .apiKeyRevoked, callback: nil)
+
+        store.setTesterToken("itt_afterthefact", expiresAt: nil)
+        XCTAssertNil(store.testerToken)
+    }
+
+    func testTerminatedSdkNeverCallsTheConfigEndpointAgain() async {
+        // ADR-0005 states the invariant outright — "a TERMINATED SDK
+        // never attempts attestation" — and ADR-0003 Decision 9 §2
+        // requires TERMINATED to disable all background tasks.
+        // `Issuetracker.configure()` calls `refreshRemoteConfig` on
+        // every launch, so without a gate inside it every terminated
+        // install hits `getSdkConfig` once per app launch, forever,
+        // across an unbounded deployed cohort. Nothing manual exercises
+        // this: it runs in the background with no UI.
         let lifecycle = LifecycleStore(defaults: defaults)
         lifecycle.transitionToTerminated(reason: .projectDeleted, callback: nil)
 
@@ -463,11 +501,118 @@ final class TerminationContractTests: XCTestCase {
         ]))
         let before = StubURLProtocol.requestCount
         await store.refreshRemoteConfig(runtime: runtime())
+        await store.refreshRemoteConfig(runtime: runtime())
 
         XCTAssertEqual(
-            StubURLProtocol.requestCount, before + 1,
-            "documents the un-gated config fetch; assert no-increment once TERMINATED gates it"
+            StubURLProtocol.requestCount, before,
+            "a terminated install must not touch the network at all"
         )
+    }
+
+    func testAHealthySdkStillFetchesItsConfigOnEveryLaunch() async {
+        // The other half of the gate: it is on TERMINATED, not on
+        // everything. ADR-0005's testers-only flag can flip while an
+        // install is deployed, so an OK install must keep refreshing.
+        let lifecycle = LifecycleStore(defaults: defaults)
+        let store = AttestationStore(defaults: defaults, lifecycle: lifecycle)
+        stub(status: 200, body: try! JSONSerialization.data(withJSONObject: [
+            "result": ["requireTesterAttestation": true],
+        ]))
+
+        let before = StubURLProtocol.requestCount
+        await store.refreshRemoteConfig(runtime: runtime(apiKey: "it_dev_healthy"))
+        XCTAssertEqual(StubURLProtocol.requestCount, before + 1)
+        XCTAssertEqual(
+            defaults.object(forKey: "io.issuetracker.sdk.remoteConfig.requireTesterAttestation") as? Bool,
+            true,
+            "the healthy path must still adopt the server's value"
+        )
+    }
+
+    func testATesterGatedSdkStillRePullsConfigAfterARejection() async {
+        // `ReportingSession.submit` re-pulls config after an ADR-0005
+        // rejection so the remote trigger goes inert. That path runs
+        // through the same guard — and must survive it, because a
+        // gating rejection is not terminal.
+        let lifecycle = LifecycleStore(defaults: defaults)
+        let store = AttestationStore(defaults: defaults, lifecycle: lifecycle)
+
+        stub(status: 403, body: callableErrorBody(
+            reason: "tester_attestation_required", recoverable: false
+        ))
+        await store.refreshRemoteConfig(runtime: runtime())
+        XCTAssertFalse(lifecycle.isTerminated)
+
+        stub(status: 200, body: try! JSONSerialization.data(withJSONObject: [
+            "result": ["requireTesterAttestation": true],
+        ]))
+        let before = StubURLProtocol.requestCount
+        await store.refreshRemoteConfig(runtime: runtime())
+        XCTAssertEqual(StubURLProtocol.requestCount, before + 1)
+    }
+
+    // MARK: - One predicate per platform (ITD-163)
+
+    func testBothDispatchSitesShareOneTerminationPredicate() async {
+        // `sdk-web` shipped two rules — its submit path dispatched on
+        // `!details.recoverable` while its config path dispatched on the
+        // reason — which are NOT equivalent: ADR-0005's tester-gating
+        // reasons are `recoverable: false` but deliberately not
+        // terminal, so the submit path would have bricked an SDK the
+        // config path keeps alive.
+        //
+        // On tvOS both sites call `TerminationPolicy.terminalReason`.
+        // This drives every contract reason off the real wire and pins
+        // that the shared predicate and the config path's observable
+        // end-state agree, reason for reason — and that neither of them
+        // is `recoverable` in disguise.
+        for entry in Self.contract {
+            let recoverable = entry.reason == "quota_exceeded" || entry.reason == "transient"
+            let suite = "\(suiteName!).predicate.\(entry.reason)"
+            let scratch = UserDefaults(suiteName: suite)!
+            defer { scratch.removePersistentDomain(forName: suite) }
+
+            stub(
+                status: entry.status,
+                body: callableErrorBody(reason: entry.reason, recoverable: recoverable)
+            )
+
+            // Site 1 — the shared predicate, as the submit path calls it.
+            let err = await expectCallableError()
+            let predicate = TerminationPolicy.terminalReason(for: err!)
+            XCTAssertEqual(
+                predicate?.rawValue, entry.terminal ? entry.reason : nil,
+                "the shared predicate disagrees with the ADR on \(entry.reason)"
+            )
+
+            // Site 2 — the config path, end to end.
+            let lifecycle = LifecycleStore(defaults: scratch)
+            let store = AttestationStore(defaults: scratch, lifecycle: lifecycle)
+            await store.refreshRemoteConfig(runtime: runtime())
+
+            XCTAssertEqual(
+                lifecycle.isTerminated, predicate != nil,
+                "the config path and the submit path's predicate diverged on \(entry.reason)"
+            )
+
+            // And the trap that caught sdk-web: recoverability is not
+            // the predicate.
+            if !recoverable && !entry.terminal {
+                XCTAssertNil(
+                    predicate,
+                    "\(entry.reason) is recoverable:false but NOT terminal (ADR-0005)"
+                )
+            }
+        }
+    }
+
+    func testTheTerminationPredicateIgnoresNonCallableErrors() {
+        // Offline, DNS failure, a malformed body — none of these are
+        // "your project is gone".
+        XCTAssertNil(TerminationPolicy.terminalReason(for: URLError(.notConnectedToInternet)))
+        XCTAssertNil(TerminationPolicy.terminalReason(for: APIClient.CallableError(
+            status: 404, message: "HTTP 404", details: nil
+        )))
     }
 
     // MARK: - Helpers

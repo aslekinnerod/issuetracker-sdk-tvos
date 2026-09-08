@@ -64,6 +64,18 @@ public enum Issuetracker {
             terminatedUI: terminatedUI
         )
         runtime = rt
+        // ADR-0003 Decision 9 §6. Breadcrumbs are report-bearing state
+        // on disk: they exist only to be attached to a future report,
+        // and on a terminated install there is no future report. They
+        // are dropped with the (structurally empty) queue on the
+        // terminal signal. Registered here rather than inside
+        // BreadcrumbStore because the store is a process-wide singleton
+        // over the real container, and the injectable stores used by
+        // tests must not reach into it. Keyed, so calling configure()
+        // twice does not stack a second handler.
+        LifecycleStore.shared.onTerminate(id: "breadcrumbs") {
+            BreadcrumbStore.shared.clear()
+        }
         // Seed remote config (testers-only gating, ADR-0005) from the
         // UserDefaults cache before the observer installs, so the very
         // first press consults real data when we have any. The network
@@ -83,13 +95,19 @@ public enum Issuetracker {
             }
         }
         Task { @MainActor in
+            // No-op on a terminated install — the gate lives inside
+            // refreshRemoteConfig so every caller of it is covered, not
+            // just this one (ADR-0003 Decision 9 §2).
             await AttestationStore.shared.refreshRemoteConfig(runtime: rt)
             // Onboarding waits for the config refresh so we never
             // advertise a trigger that is gated off for this install —
             // and never wrongly suppress it on a prod key's first
             // launch just because the fail-closed default was still in
-            // effect.
-            if showOnboarding, AttestationStore.shared.canTriggerReport {
+            // effect. A terminated install is never taught a trigger
+            // whose only destination is the terminal panel.
+            if showOnboarding,
+               !LifecycleStore.shared.isTerminated,
+               AttestationStore.shared.canTriggerReport {
                 OnboardingPresenter.presentIfNeeded(
                     longPressEnabled: longPressToReport
                 )
@@ -109,6 +127,10 @@ public enum Issuetracker {
             assertionFailure("Issuetracker.showOnboarding() called before configure()")
             return
         }
+        // Terminated installs are never taught the trigger: the panel
+        // would advertise a gesture whose only destination is the
+        // terminal message (ADR-0003 Decision 9 §5).
+        guard !LifecycleStore.shared.isTerminated else { return }
         // The trigger state is re-derived from the installed observer
         // rather than threading another flag through Runtime, so a
         // single source of truth governs both runtime behaviour and

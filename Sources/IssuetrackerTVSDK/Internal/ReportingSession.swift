@@ -251,7 +251,9 @@ enum ReportingSession {
             // submit panel with TerminatedView so the user lands on
             // the authoritative end-state immediately — no need to
             // dismiss and re-trigger to discover bug reporting is gone.
-            if let reason = err.sdkErrorReason, reason.isTerminal {
+            // Same predicate as the config path, by construction
+            // (ITD-163) — see ``TerminationPolicy``.
+            if let reason = TerminationPolicy.terminalReason(for: err) {
                 LifecycleStore.shared.transitionToTerminated(
                     reason: reason,
                     callback: runtime.onConfigurationError

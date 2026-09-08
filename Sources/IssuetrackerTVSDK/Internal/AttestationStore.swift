@@ -41,6 +41,15 @@ final class AttestationStore {
     init(defaults: UserDefaults = .standard, lifecycle: LifecycleStore? = nil) {
         self.defaults = defaults
         self.lifecycle = lifecycle ?? .shared
+        // ADR-0003 Decision 9 §6. tvOS ships no offline report queue,
+        // but the tester token is report-bearing state all the same: a
+        // live ingest credential for the very project the server has
+        // just declared deleted / revoked / suspended. It goes with the
+        // (empty) queue on the terminal signal, and on any later launch
+        // that finds the marker already set.
+        self.lifecycle.onTerminate(id: "attestation") { [weak self] in
+            self?.clearTesterToken()
+        }
     }
 
     /// Synchronous part of configure(): seed the in-memory value from
@@ -59,6 +68,19 @@ final class AttestationStore {
     }
 
     func refreshRemoteConfig(runtime: Runtime) async {
+        // ADR-0003 Decision 9 §2: TERMINATED disables all background
+        // tasks; ADR-0005 states it for this call specifically ("a
+        // TERMINATED SDK never attempts attestation"). Without this
+        // gate every terminated install POSTs `getSdkConfig` once per
+        // app launch, forever, across an unbounded deployed cohort —
+        // the exact hammering Decision 9 exists to cap, and invisible
+        // because it happens in the background.
+        //
+        // The gate is on TERMINATED and nothing else: a healthy SDK
+        // still refreshes on every launch, and a SUSPENDED /
+        // tester-gated one still re-pulls config after a rejection.
+        guard !lifecycle.isTerminated else { return }
+
         struct ConfigResult: Decodable { let requireTesterAttestation: Bool }
         do {
             let result: ConfigResult = try await APIClient.call(
@@ -67,21 +89,22 @@ final class AttestationStore {
                 payload: ["apiKey": runtime.apiKey]
             )
             adopt(requireTesterAttestation: result.requireTesterAttestation, apiKey: runtime.apiKey)
-        } catch let err as APIClient.CallableError {
+        } catch {
             // A terminal signal on the config fetch (key revoked,
             // project deleted, …) is as authoritative as one on
             // submission — flip to TERMINATED here too so a dead
             // cohort stops before it ever reaches the report endpoint.
-            // Anything else (offline, transient) leaves the cached /
-            // fail-mode value in charge.
-            if let reason = err.sdkErrorReason, reason.isTerminal {
+            // Anything else (offline, transient, tester-gating) leaves
+            // the cached / fail-mode value in charge.
+            //
+            // Same predicate as the submit path, by construction
+            // (ITD-163) — see ``TerminationPolicy``.
+            if let reason = TerminationPolicy.terminalReason(for: error) {
                 lifecycle.transitionToTerminated(
                     reason: reason,
                     callback: runtime.onConfigurationError
                 )
             }
-        } catch {
-            // Network-level failure — keep the cached/fail-mode value.
         }
     }
 
@@ -115,6 +138,11 @@ final class AttestationStore {
     }
 
     func setTesterToken(_ token: String, expiresAt: Date?) {
+        // Storing an ingest credential on a terminated install would
+        // re-create exactly the state the purge just removed — the host
+        // app's companion handshake has no way of knowing the SDK is
+        // dead. Silently ignored (ADR-0003 Decision 9 §6).
+        guard !lifecycle.isTerminated else { return }
         defaults.set(token, forKey: tokenKey)
         if let expiresAt {
             defaults.set(expiresAt.timeIntervalSince1970, forKey: tokenExpiresKey)

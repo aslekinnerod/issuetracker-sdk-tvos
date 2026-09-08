@@ -28,6 +28,15 @@ final class LifecycleStore {
     private let reasonKey = "io.issuetracker.sdk.terminatedReason"
     private let atKey = "io.issuetracker.sdk.terminatedAt"
 
+    // ADR-0003 Decision 9 §6: report-bearing local state is dropped on
+    // the terminal signal. The state itself lives in the stores that
+    // own it (attestation token, breadcrumbs), so each registers a
+    // purge here rather than this type reaching into process-wide
+    // singletons — which would also make the injectable test stores
+    // clobber production state. Keyed so a repeated `configure()`
+    // replaces its handler instead of stacking another copy.
+    private var purgeHandlers: [String: () -> Void] = [:]
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         // Restore from disk so a process restart doesn't re-attempt
@@ -50,6 +59,20 @@ final class LifecycleStore {
         return false
     }
 
+    /// Registers a purge of report-bearing local state, run inside the
+    /// OK → TERMINATED transition (ADR-0003 Decision 9 §6).
+    ///
+    /// The handler also runs immediately when the store is *already*
+    /// terminated. That covers the launch after a purge that never
+    /// finished — the process was killed between the marker write and
+    /// the purge — so the fail-safe direction is "terminated, and the
+    /// state is gone" rather than "terminated, credential retained".
+    /// Handlers must therefore be idempotent.
+    func onTerminate(id: String, purge: @escaping () -> Void) {
+        purgeHandlers[id] = purge
+        if isTerminated { purge() }
+    }
+
     /// Idempotent: re-terminating with a different reason keeps the
     /// first one. The first non-recoverable failure is authoritative;
     /// later failures should have been gated and only happen if a
@@ -61,8 +84,14 @@ final class LifecycleStore {
         guard !isTerminated else { return }
         let now = Date()
         state = .terminated(reason: reason, at: now)
+        // Marker before purge: if the process dies mid-transition the
+        // next launch must still come up TERMINATED (and `onTerminate`
+        // re-runs the purge then).
         defaults.set(reason.rawValue, forKey: reasonKey)
         defaults.set(now.timeIntervalSince1970, forKey: atKey)
+        for purge in purgeHandlers.values { purge() }
+        // Host callback last, so anything it inspects already reflects
+        // the purged state.
         callback?(reason)
     }
 }
